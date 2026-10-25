@@ -1,5 +1,6 @@
 package design.antics.focusstack;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Intent;
@@ -49,13 +50,15 @@ public class MainActivity extends Activity {
     // typical stack stays well under a few hundred MB resident.
     private static final int MAX_MEGAPIXELS = 12_000_000;
     private static final int PICK_IMAGES_REQUEST = 1;
+    private static final int CAPTURE_REQUEST = 2;
+    private static final int CAMERA_PERMISSION_REQUEST = 3;
 
     private static final int PICK_IMAGES_MAX = 20;
 
     private TextView status;
     private ImageView preview;
     private ProgressBar progress;
-    private Button pickButton;
+    private Button pickButton, captureButton;
 
     private HandlerThread workerThread;
     private Handler workerHandler;
@@ -87,6 +90,11 @@ public class MainActivity extends Activity {
         pickButton.setText("Select Photos");
         pickButton.setOnClickListener(v -> launchPicker());
         root.addView(pickButton);
+
+        captureButton = new Button(this);
+        captureButton.setText("Capture Stack with Camera");
+        captureButton.setOnClickListener(v -> launchCapture());
+        root.addView(captureButton);
 
         progress = new ProgressBar(this);
         progress.setIndeterminate(true);
@@ -126,10 +134,46 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, PICK_IMAGES_REQUEST);
     }
 
+    private void launchCapture() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST);
+            return;
+        }
+        startActivityForResult(new Intent(this, CaptureActivity.class), CAPTURE_REQUEST);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == CAMERA_PERMISSION_REQUEST
+                && results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+            startActivityForResult(new Intent(this, CaptureActivity.class), CAPTURE_REQUEST);
+        }
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != PICK_IMAGES_REQUEST || data == null) {
+        if (data == null) {
+            return;
+        }
+
+        if (requestCode == CAPTURE_REQUEST) {
+            if (resultCode != RESULT_OK) return;
+            List<String> paths = data.getStringArrayListExtra(CaptureActivity.EXTRA_RESULT_PATHS);
+            if (paths == null || paths.size() < 2) {
+                Toast.makeText(this, "Capture did not produce enough shots", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            List<Uri> uris = new ArrayList<>();
+            for (String path : paths) {
+                uris.add(Uri.fromFile(new File(path)));
+            }
+            runStack(uris);
+            return;
+        }
+
+        if (requestCode != PICK_IMAGES_REQUEST) {
             return;
         }
 
@@ -154,6 +198,7 @@ public class MainActivity extends Activity {
     private void runStack(List<Uri> uris) {
         setBusy(true, "Preparing " + uris.size() + " photos…");
         pickButton.setEnabled(false);
+        captureButton.setEnabled(false);
 
         workerHandler.post(() -> {
             try {
@@ -195,12 +240,14 @@ public class MainActivity extends Activity {
                 ? "Saved to Pictures/FocusStack"
                 : "Stacked, but saving to gallery failed");
         pickButton.setEnabled(true);
+        captureButton.setEnabled(true);
         preview.setImageBitmap(BitmapFactory.decodeFile(outFile.getAbsolutePath()));
     }
 
     private void onStackFailed(String message) {
         setBusy(false, "Failed: " + message);
         pickButton.setEnabled(true);
+        captureButton.setEnabled(true);
     }
 
     private void setBusy(boolean busy, String message) {
