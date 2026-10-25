@@ -18,10 +18,12 @@ import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.util.Log;
 import android.util.Size;
 import android.util.SizeF;
 import android.util.SparseIntArray;
@@ -39,7 +41,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Guided manual-focus bracket capture. Two ways to set the far/near points:
@@ -71,6 +75,7 @@ import java.util.List;
 public class CaptureActivity extends Activity implements TextureView.SurfaceTextureListener {
 
     static final String EXTRA_RESULT_PATHS = "design.antics.focusstack.RESULT_PATHS";
+    private static final String LOG_TAG = "focusstack_capture";
 
     private static final int CAMERA_PERMISSION_REQUEST = 10;
     private static final int DEFAULT_SHOTS = 8;
@@ -101,15 +106,17 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         final String label;
         final float minFocusDistance; // diopters
         final int sensorOrientation;
-        final CameraCharacteristics characteristics;
+        final CameraCharacteristics characteristics; // always the LOGICAL camera's, for stream config
+        final Float zoomRatio; // null = don't set CONTROL_ZOOM_RATIO at all
 
-        CameraChoice(String id, String label, float minFocusDistance,
-                     int sensorOrientation, CameraCharacteristics characteristics) {
+        CameraChoice(String id, String label, float minFocusDistance, int sensorOrientation,
+                     CameraCharacteristics characteristics, Float zoomRatio) {
             this.id = id;
             this.label = label;
             this.minFocusDistance = minFocusDistance;
             this.sensorOrientation = sensorOrientation;
             this.characteristics = characteristics;
+            this.zoomRatio = zoomRatio;
         }
     }
 
@@ -130,6 +137,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private CameraCharacteristics characteristics;
     private int sensorOrientation;
     private float minFocusDistance; // diopters; 0 or absent = fixed-focus lens, unsupported
+    private Float zoomRatio; // null = don't set CONTROL_ZOOM_RATIO
 
     private CameraDevice cameraDevice;
     private CameraCaptureSession session;
@@ -367,16 +375,59 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
             for (String id : cameraManager.getCameraIdList()) {
                 CameraCharacteristics c = cameraManager.getCameraCharacteristics(id);
                 Float minDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
-                if (minDist == null || minDist <= 0f) continue; // fixed-focus lens
-
                 Integer facing = c.get(CameraCharacteristics.LENS_FACING);
                 boolean isBack = facing != null && facing == CameraCharacteristics.LENS_FACING_BACK;
                 Integer orient = c.get(CameraCharacteristics.SENSOR_ORIENTATION);
-                String label = String.format("%s (%.0f°, %.1fD)",
-                        isBack ? "Back" : "Front", horizontalFovDeg(c), minDist);
-                CameraChoice choice = new CameraChoice(
-                        id, label, minDist, orient == null ? 90 : orient, c);
-                (isBack ? back : front).add(choice);
+                float fov = horizontalFovDeg(c);
+                int[] afModes = c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+                Set<String> physIds = Build.VERSION.SDK_INT >= 28
+                        ? c.getPhysicalCameraIds() : null;
+
+                boolean usable = minDist != null && minDist > 0f;
+                Log.i(LOG_TAG, String.format(
+                        "camera id=%s facing=%s fov=%.1f° minFocusDistance=%s sensorOrientation=%s "
+                                + "afModes=%s physicalIds=%s -> %s",
+                        id, isBack ? "BACK" : (facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT ? "FRONT" : "EXTERNAL"),
+                        fov, minDist, orient, Arrays.toString(afModes), physIds,
+                        usable ? "usable (manual focus)" : "SKIPPED (fixed focus / no LENS_INFO_MINIMUM_FOCUS_DISTANCE)"));
+
+                // Hidden physical sub-lenses (Pixel-style logical multi-camera) aren't
+                // offered as separate choices (see class javadoc), but log their own
+                // FOV/focus range too since that's exactly what a "why doesn't the
+                // ultrawide focus" report needs to see.
+                if (physIds != null) {
+                    for (String pid : physIds) {
+                        try {
+                            CameraCharacteristics pc = cameraManager.getCameraCharacteristics(pid);
+                            Float pMinDist = pc.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+                            Log.i(LOG_TAG, String.format(
+                                    "  physical id=%s (of logical %s) fov=%.1f° minFocusDistance=%s",
+                                    pid, id, horizontalFovDeg(pc), pMinDist));
+                        } catch (Exception e) {
+                            Log.i(LOG_TAG, "  physical id=" + pid + ": characteristics refused (" + e + ")");
+                        }
+                    }
+                }
+
+                if (isBack && physIds != null && !physIds.isEmpty()) {
+                    // Pixel-style logical multi-camera: its own reported FOV
+                    // and LENS_INFO_MINIMUM_FOCUS_DISTANCE describe whatever
+                    // physical lens is active at zoom=1x (the main lens here
+                    // — confirmed on-device: id 0's own values matched id 2's
+                    // exactly). Manual focus set on the logical camera can't
+                    // reach a lens it never engages, which is why ultrawide
+                    // focus "didn't work": the app never asked for it. Lenses
+                    // are selected on a logical multi-camera via
+                    // CONTROL_ZOOM_RATIO (API 30+), not by camera id, so each
+                    // distinct physical lens becomes its own zoom-ratio preset.
+                    back.addAll(buildZoomPresets(id, c, fov));
+                } else if (usable) {
+                    String label = String.format("%s (%.0f°, %.1fD)",
+                            isBack ? "Back" : "Front", fov, minDist);
+                    CameraChoice choice = new CameraChoice(
+                            id, label, minDist, orient == null ? 90 : orient, c, null);
+                    (isBack ? back : front).add(choice);
+                }
             }
             cameraChoices.addAll(back);
             cameraChoices.addAll(front);
@@ -389,6 +440,83 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
             return false;
         }
         return true;
+    }
+
+    /**
+     * One CameraChoice per distinct physical lens behind a logical back
+     * camera, each carrying the CONTROL_ZOOM_RATIO that engages it. Falls
+     * back to the logical camera's own single (main-lens) range if zoom
+     * ratio isn't supported (pre-API 30) or every physical id turns out to
+     * be an unusable duplicate/fixed-focus lens.
+     */
+    private List<CameraChoice> buildZoomPresets(String logicalId, CameraCharacteristics logical, float logicalFov) {
+        List<CameraChoice> presets = new ArrayList<>();
+        android.util.Range<Float> zoomRange = Build.VERSION.SDK_INT >= 30
+                ? logical.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) : null;
+
+        if (zoomRange != null) {
+            // Reference lens = whichever physical id's FOV is closest to the
+            // logical camera's own default (zoom=1x) FOV.
+            float mainFov = logicalFov;
+            float bestDiff = Float.MAX_VALUE;
+            for (String pid : logical.getPhysicalCameraIds()) {
+                try {
+                    float pFov = horizontalFovDeg(cameraManager.getCameraCharacteristics(pid));
+                    float diff = Math.abs(pFov - logicalFov);
+                    if (diff < bestDiff) {
+                        bestDiff = diff;
+                        mainFov = pFov;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
+            for (String pid : logical.getPhysicalCameraIds()) {
+                CameraCharacteristics pc;
+                Float pMinDist;
+                try {
+                    pc = cameraManager.getCameraCharacteristics(pid);
+                    pMinDist = pc.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+                } catch (Exception e) {
+                    continue;
+                }
+                if (pMinDist == null || pMinDist <= 0f) continue; // fixed-focus physical lens
+
+                float pFov = horizontalFovDeg(pc);
+                // Multi-resolution clone ids report near-identical optics to
+                // a lens already kept (confirmed on-device: ids 5/6 matched
+                // 2/4's fov and minFocusDistance exactly) — skip those.
+                boolean duplicate = false;
+                for (CameraChoice kept : presets) {
+                    if (Math.abs(kept.minFocusDistance - pMinDist) < 0.5f) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+
+                float ratio = (float) (Math.tan(Math.toRadians(mainFov / 2.0))
+                        / Math.tan(Math.toRadians(pFov / 2.0)));
+                ratio = Math.max(zoomRange.getLower(), Math.min(zoomRange.getUpper(), ratio));
+
+                String label = String.format("Back ×%.1f (%.0f°, %.1fD)", ratio, pFov, pMinDist);
+                presets.add(new CameraChoice(logicalId, label, pMinDist,
+                        logical.get(CameraCharacteristics.SENSOR_ORIENTATION) == null
+                                ? 90 : logical.get(CameraCharacteristics.SENSOR_ORIENTATION),
+                        logical, ratio));
+            }
+        }
+
+        if (presets.isEmpty()) {
+            Float minDist = logical.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            if (minDist != null && minDist > 0f) {
+                Integer orient = logical.get(CameraCharacteristics.SENSOR_ORIENTATION);
+                String label = String.format("Back (%.0f°, %.1fD)", logicalFov, minDist);
+                presets.add(new CameraChoice(logicalId, label, minDist,
+                        orient == null ? 90 : orient, logical, null));
+            }
+        }
+        return presets;
     }
 
     private static float horizontalFovDeg(CameraCharacteristics c) {
@@ -415,6 +543,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         characteristics = choice.characteristics;
         sensorOrientation = choice.sensorOrientation;
         minFocusDistance = choice.minFocusDistance;
+        zoomRatio = choice.zoomRatio;
 
         cameraButton.setText("Lens: " + choice.label);
         cameraButton.setEnabled(cameraChoices.size() > 1);
@@ -601,7 +730,15 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         if (focusDistance != null) {
             req.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance);
         }
+        applyZoomRatio(req);
         session.setRepeatingRequest(req.build(), afCallback, bgHandler);
+    }
+
+    /** Selects which physical lens a logical multi-camera engages (API 30+ only). */
+    private void applyZoomRatio(CaptureRequest.Builder builder) {
+        if (zoomRatio != null) {
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio);
+        }
     }
 
     @Override
@@ -641,6 +778,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
             req.addTarget(previewSurface);
             req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
             req.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+            applyZoomRatio(req);
             session.capture(req.build(), afCallback, bgHandler);
             afTimeoutRunnable = this::onAfLockTimeout;
             bgHandler.postDelayed(afTimeoutRunnable, AF_LOCK_TIMEOUT_MS);
@@ -703,6 +841,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
                         cancel.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
                         cancel.set(CaptureRequest.CONTROL_AF_TRIGGER,
                                 CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
+                        applyZoomRatio(cancel);
                         s.capture(cancel.build(), null, bgHandler);
                         setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
                     } catch (CameraAccessException ignored) {
@@ -771,6 +910,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
             req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
             req.set(CaptureRequest.LENS_FOCUS_DISTANCE, distance);
             req.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation());
+            applyZoomRatio(req);
             session.capture(req.build(), null, bgHandler);
         } catch (CameraAccessException e) {
             abortCapture("Still capture failed: " + e.getMessage());
