@@ -53,13 +53,18 @@ import java.util.List;
  * the canonical correct way to drive CONTROL_AF_TRIGGER.
  *
  * A lens selector cycles whole camera ids (not Pixel-style hidden physical
- * sub-lenses — binding a single physical id via
- * OutputConfiguration.setPhysicalCameraId produced a black/near-empty
- * preview on-device, and isn't worth chasing here; see stereovision's
- * StereoRig for where that technique *is* proven, binding two physical
- * streams at once rather than one). A FocusBarView shows, read-only, where
- * the AF-lock results landed and what the planned bracket's steps are —
- * it doesn't drive focus itself, the AF-lock buttons still do.
+ * sub-lenses selectable via OutputConfiguration.setPhysicalCameraId, as
+ * stereovision's StereoRig does — out of scope here, not because it's
+ * broken). A FocusBarView shows, read-only, where the AF-lock results
+ * landed and what the planned bracket's steps are — it doesn't drive focus
+ * itself, the AF-lock buttons still do.
+ *
+ * (A previous version of this comment blamed a black preview on
+ * single-physical-id binding; that was wrong. The actual cause was
+ * FocusBarView missing onMeasure — WRAP_CONTENT next to a weight=1 sibling
+ * in a vertical LinearLayout let it claim the whole remaining height,
+ * collapsing the TextureView to 0px and pushing every control below it
+ * off-screen. Fixed in FocusBarView.onMeasure().)
  */
 public class CaptureActivity extends Activity implements TextureView.SurfaceTextureListener {
 
@@ -73,8 +78,9 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     // LENS_FOCUS_DISTANCE changes aren't guaranteed to take effect by the
     // very next capture on every HAL; there's no portable "lens settled"
     // signal cheap enough to poll per-step, so a fixed delay after each
-    // focus change is the pragmatic choice here (confirmed on-device: a
-    // Pixel 8 Pro settles well within this).
+    // focus change is the pragmatic choice here. Not yet verified
+    // on-device against real stacked output — if stacks come out soft,
+    // check this first.
     private static final long FOCUS_SETTLE_MS = 180;
 
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
@@ -129,6 +135,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private ImageReader stillReader;
 
     private AfState afState = AfState.PREVIEW;
+    private Runnable afTimeoutRunnable;
     private Float farDistance, nearDistance;
     private int shots = DEFAULT_SHOTS;
 
@@ -531,12 +538,22 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         setControlsEnabled(false);
         status.setText("Focusing (" + (isFar ? "far" : "near") + ")…");
         try {
+            // The repeating request has to switch to AF_MODE_AUTO *before*
+            // the trigger goes out, not just on the one-shot trigger
+            // request itself — leaving the repeating request on
+            // CONTINUOUS_PICTURE while the trigger uses AUTO resets the AF
+            // state machine on the next repeating frame, so CONTROL_AF_STATE
+            // never reaches a locked value. This was the actual cause of
+            // the original "autofocus times out" report, not a timeout
+            // that was too short.
+            setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_AUTO, null);
             CaptureRequest.Builder req = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             req.addTarget(previewSurface);
             req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
             req.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
             session.capture(req.build(), afCallback, bgHandler);
-            bgHandler.postDelayed(() -> onAfLockTimeout(afState), AF_LOCK_TIMEOUT_MS);
+            afTimeoutRunnable = this::onAfLockTimeout;
+            bgHandler.postDelayed(afTimeoutRunnable, AF_LOCK_TIMEOUT_MS);
         } catch (CameraAccessException e) {
             afState = AfState.PREVIEW;
             uiHandler.post(() -> {
@@ -546,8 +563,14 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         }
     }
 
-    private void onAfLockTimeout(AfState stateWhenScheduled) {
-        if (afState != stateWhenScheduled) return; // already resolved
+    private void onAfLockTimeout() {
+        // afTimeoutRunnable is cancelled via removeCallbacks() as soon as
+        // afCallback resolves the lock, but guard anyway: a prior version
+        // captured afState into the Runnable's closure at schedule time
+        // and compared against the (always-current) field, so this check
+        // was always false and every lock attempt — including successful
+        // ones — got overwritten with a bogus timeout message 2.5s later.
+        if (afState == AfState.PREVIEW) return;
         afState = AfState.PREVIEW;
         try {
             setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
@@ -570,6 +593,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
                             || af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
                     if (!locked) return;
 
+                    bgHandler.removeCallbacks(afTimeoutRunnable);
                     Float distance = result.get(CaptureResult.LENS_FOCUS_DISTANCE);
                     boolean wasFar = afState == AfState.WAITING_LOCK_FAR;
                     afState = AfState.PREVIEW;
@@ -606,6 +630,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
                 @Override
                 public void onCaptureFailed(CameraCaptureSession s, CaptureRequest r, CaptureFailure failure) {
                     if (afState == AfState.PREVIEW) return;
+                    bgHandler.removeCallbacks(afTimeoutRunnable);
                     afState = AfState.PREVIEW;
                     uiHandler.post(() -> {
                         status.setText("Autofocus capture failed, try again");

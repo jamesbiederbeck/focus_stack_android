@@ -96,6 +96,21 @@ final class FocusBarView extends View {
         invalidate();
     }
 
+    @Override
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        // Without this, WRAP_CONTENT next to a weight=1 sibling in a
+        // vertical LinearLayout resolves to an AT_MOST spec covering the
+        // whole remaining height, and the default View.getDefaultSize()
+        // just takes it — this view then eats all the space meant for the
+        // TextureView preview above it (which collapses to 0px) and every
+        // control below it gets pushed off-screen. Confirmed on-device:
+        // this was the actual cause of the "camera view doesn't work"
+        // black screen, not a camera/HAL issue.
+        int height = resolveSize((int) (64 * density), heightMeasureSpec);
+        int width = getDefaultSize(getSuggestedMinimumWidth(), widthMeasureSpec);
+        setMeasuredDimension(width, height);
+    }
+
     private float clamp(float d) {
         return Math.max(minDistance, Math.min(maxDistance, d));
     }
