@@ -15,11 +15,9 @@ import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
-import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -41,24 +39,27 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.Set;
 
 /**
- * Guided manual-focus bracket capture. A {@link FocusBarView} drives
- * LENS_FOCUS_DISTANCE directly while the user drags it (real-time
- * focus-by-eye on the live preview — no autofocus in the loop, which is
- * what made the old CONTROL_AF_TRIGGER-based "Focus Far"/"Focus Near"
- * buttons time out on some devices); "Set Far"/"Set Near" just record
- * wherever the bar currently is, and "Capture N" shoots a manual-focus
- * series between those two points. A lens selector cycles through every
- * camera id *and*, where the device exposes one (Pixel-style logical
- * multi-camera — see stereovision's StereoRig/CLAUDE.md for how this was
- * discovered), its physical sub-lenses via
- * {@link OutputConfiguration#setPhysicalCameraId}, since macro-capable
- * lenses are often hidden behind a single logical id. Framework Camera2
- * only, no CameraX/androidx.
+ * Guided manual-focus bracket capture: "Focus Far"/"Focus Near" each
+ * autofocus-and-lock on whatever the camera is pointed at and record the
+ * resulting lens distance; "Capture N" then shoots a manual-focus series
+ * (CONTROL_AF_MODE_OFF, stepping LENS_FOCUS_DISTANCE linearly in diopters)
+ * between those two points and returns the file paths, in far-to-near
+ * order, for MainActivity to feed into FocusStackBridge. Framework Camera2
+ * only (no CameraX/androidx), matching the rest of this tree; the
+ * focus-lock state machine mirrors Google's Camera2Basic sample, which is
+ * the canonical correct way to drive CONTROL_AF_TRIGGER.
+ *
+ * A lens selector cycles whole camera ids (not Pixel-style hidden physical
+ * sub-lenses — binding a single physical id via
+ * OutputConfiguration.setPhysicalCameraId produced a black/near-empty
+ * preview on-device, and isn't worth chasing here; see stereovision's
+ * StereoRig for where that technique *is* proven, binding two physical
+ * streams at once rather than one). A FocusBarView shows, read-only, where
+ * the AF-lock results landed and what the planned bracket's steps are —
+ * it doesn't drive focus itself, the AF-lock buttons still do.
  */
 public class CaptureActivity extends Activity implements TextureView.SurfaceTextureListener {
 
@@ -68,17 +69,13 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private static final int DEFAULT_SHOTS = 8;
     private static final int MIN_SHOTS = 3;
     private static final int MAX_SHOTS = 20;
-    private static final long AUTOFOCUS_ASSIST_TIMEOUT_MS = 1200;
+    private static final long AF_LOCK_TIMEOUT_MS = 2500;
     // LENS_FOCUS_DISTANCE changes aren't guaranteed to take effect by the
     // very next capture on every HAL; there's no portable "lens settled"
     // signal cheap enough to poll per-step, so a fixed delay after each
     // focus change is the pragmatic choice here (confirmed on-device: a
     // Pixel 8 Pro settles well within this).
     private static final long FOCUS_SETTLE_MS = 180;
-    // Manual-focus preview updates are pushed on every drag event; throttle
-    // how often that actually hits the camera HAL so a fast drag doesn't
-    // flood setRepeatingRequest().
-    private static final long FOCUS_PREVIEW_THROTTLE_MS = 50;
 
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
     static {
@@ -88,20 +85,19 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         ORIENTATIONS.append(Surface.ROTATION_270, 180);
     }
 
-    /** One selectable lens: either a whole logical camera id, or a physical sub-lens of one. */
+    private enum AfState { PREVIEW, WAITING_LOCK_FAR, WAITING_LOCK_NEAR }
+
+    /** One whole camera id (back or front) that reports manual focus support. */
     private static final class CameraChoice {
-        final String logicalId;
-        final String physicalId; // null unless this is a physical sub-lens
+        final String id;
         final String label;
         final float minFocusDistance; // diopters
         final int sensorOrientation;
-        final CameraCharacteristics characteristics; // the physical one if physicalId != null
+        final CameraCharacteristics characteristics;
 
-        CameraChoice(String logicalId, String physicalId, String label,
-                     float minFocusDistance, int sensorOrientation,
-                     CameraCharacteristics characteristics) {
-            this.logicalId = logicalId;
-            this.physicalId = physicalId;
+        CameraChoice(String id, String label, float minFocusDistance,
+                     int sensorOrientation, CameraCharacteristics characteristics) {
+            this.id = id;
             this.label = label;
             this.minFocusDistance = minFocusDistance;
             this.sensorOrientation = sensorOrientation;
@@ -112,8 +108,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private TextureView textureView;
     private FocusBarView focusBar;
     private TextView status, shotsLabel;
-    private Button cameraButton, autofocusButton, farButton, nearButton, captureButton,
-            minusButton, plusButton;
+    private Button cameraButton, farButton, nearButton, captureButton, minusButton, plusButton;
 
     private HandlerThread bgThread;
     private Handler bgHandler;
@@ -122,6 +117,10 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private CameraManager cameraManager;
     private List<CameraChoice> cameraChoices;
     private int selectedChoice;
+    private String cameraId;
+    private CameraCharacteristics characteristics;
+    private int sensorOrientation;
+    private float minFocusDistance; // diopters; 0 or absent = fixed-focus lens, unsupported
 
     private CameraDevice cameraDevice;
     private CameraCaptureSession session;
@@ -129,10 +128,9 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private Size previewSize, stillSize;
     private ImageReader stillReader;
 
+    private AfState afState = AfState.PREVIEW;
     private Float farDistance, nearDistance;
     private int shots = DEFAULT_SHOTS;
-    private boolean autofocusing;
-    private long lastFocusPushMs;
 
     private boolean capturing;
     private float[] bracketSteps;
@@ -147,9 +145,9 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         buildUi();
 
         if (!discoverCameras()) {
-            return; // already reported why and finish()ed
+            return; // discoverCameras() already reported why and will finish()
         }
-        applyChoiceToUi();
+        applyChoice(0);
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST);
@@ -164,20 +162,21 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
 
         textureView = new TextureView(this);
         textureView.setSurfaceTextureListener(this);
-        root.addView(textureView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+        textureView.setLayoutParams(previewParams);
+        root.addView(textureView);
 
         cameraButton = new Button(this);
         cameraButton.setOnClickListener(v -> cycleCamera());
         root.addView(cameraButton);
 
         focusBar = new FocusBarView(this);
-        focusBar.setListener(this::onFocusBarDragged);
         root.addView(focusBar, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
         status = new TextView(this);
-        status.setText("Drag the bar to focus, then set the far and near points.");
+        status.setText("Point the camera, then set the far and near focus points.");
         status.setGravity(Gravity.CENTER);
         int pad = (int) (12 * getResources().getDisplayMetrics().density);
         status.setPadding(pad, pad, pad, pad);
@@ -185,18 +184,16 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
 
         LinearLayout focusRow = new LinearLayout(this);
         focusRow.setOrientation(LinearLayout.HORIZONTAL);
-        autofocusButton = new Button(this);
-        autofocusButton.setText("Autofocus");
-        autofocusButton.setOnClickListener(v -> autofocusAssist());
         farButton = new Button(this);
-        farButton.setText("Set Far");
-        farButton.setOnClickListener(v -> setBound(true));
+        farButton.setText("Focus Far");
+        farButton.setEnabled(false);
+        farButton.setOnClickListener(v -> lockFocus(true));
         nearButton = new Button(this);
-        nearButton.setText("Set Near");
-        nearButton.setOnClickListener(v -> setBound(false));
-        for (Button b : new Button[]{autofocusButton, farButton, nearButton}) {
-            focusRow.addView(b, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        }
+        nearButton.setText("Focus Near");
+        nearButton.setEnabled(false);
+        nearButton.setOnClickListener(v -> lockFocus(false));
+        focusRow.addView(farButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        focusRow.addView(nearButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         root.addView(focusRow);
 
         LinearLayout shotsRow = new LinearLayout(this);
@@ -232,16 +229,6 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         updateIntervalPreview();
     }
 
-    private void setControlsEnabled(boolean enabled) {
-        cameraButton.setEnabled(enabled && cameraChoices.size() > 1);
-        autofocusButton.setEnabled(enabled);
-        farButton.setEnabled(enabled);
-        nearButton.setEnabled(enabled);
-        minusButton.setEnabled(enabled);
-        plusButton.setEnabled(enabled);
-        captureButton.setEnabled(enabled && farDistance != null && nearDistance != null);
-    }
-
     private void updateIntervalPreview() {
         if (farDistance == null || nearDistance == null) {
             focusBar.setIntervalSteps(null);
@@ -260,54 +247,54 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         return steps;
     }
 
-    // ---- camera + lens discovery (no permission needed for characteristics) --
+    private void setControlsEnabled(boolean enabled) {
+        cameraButton.setEnabled(enabled && cameraChoices.size() > 1);
+        farButton.setEnabled(enabled);
+        nearButton.setEnabled(enabled);
+        minusButton.setEnabled(enabled);
+        plusButton.setEnabled(enabled);
+        captureButton.setEnabled(enabled && farDistance != null && nearDistance != null);
+    }
 
-    /** Returns false (and finishes the activity) if no usable lens exists. */
+    // ---- camera discovery (no permission needed for characteristics) ----
+
+    /**
+     * Enumerates every whole camera id with manual focus support (back ids
+     * before front, matching the original back-camera-only pick as the
+     * default). Deliberately id-level only — see the class javadoc for why
+     * Pixel's hidden physical sub-lenses aren't offered here.
+     * Returns false (and finishes the activity) if none qualify.
+     */
     private boolean discoverCameras() {
         cameraChoices = new ArrayList<>();
         try {
+            List<CameraChoice> back = new ArrayList<>();
+            List<CameraChoice> front = new ArrayList<>();
             for (String id : cameraManager.getCameraIdList()) {
                 CameraCharacteristics c = cameraManager.getCameraCharacteristics(id);
+                Float minDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+                if (minDist == null || minDist <= 0f) continue; // fixed-focus lens
+
                 Integer facing = c.get(CameraCharacteristics.LENS_FACING);
-                String facingLabel = facing != null && facing == CameraCharacteristics.LENS_FACING_BACK
-                        ? "Back" : facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT
-                        ? "Front" : "External";
-
-                addChoiceIfUsable(id, null, facingLabel, c);
-
-                Set<String> physIds = Build.VERSION.SDK_INT >= 28 ? c.getPhysicalCameraIds() : null;
-                if (physIds != null && physIds.size() > 1) {
-                    for (String pid : physIds) {
-                        try {
-                            CameraCharacteristics pc = cameraManager.getCameraCharacteristics(pid);
-                            addChoiceIfUsable(id, pid, facingLabel + " lens " + pid, pc);
-                        } catch (Exception ignored) {
-                            // Hidden physical ids sometimes refuse a direct characteristics
-                            // query even though they're valid as an output target.
-                        }
-                    }
-                }
+                boolean isBack = facing != null && facing == CameraCharacteristics.LENS_FACING_BACK;
+                Integer orient = c.get(CameraCharacteristics.SENSOR_ORIENTATION);
+                String label = String.format("%s (%.0f°, %.1fD)",
+                        isBack ? "Back" : "Front", horizontalFovDeg(c), minDist);
+                CameraChoice choice = new CameraChoice(
+                        id, label, minDist, orient == null ? 90 : orient, c);
+                (isBack ? back : front).add(choice);
             }
+            cameraChoices.addAll(back);
+            cameraChoices.addAll(front);
         } catch (CameraAccessException e) {
             fail("Camera discovery failed: " + e.getMessage());
             return false;
         }
-
         if (cameraChoices.isEmpty()) {
             fail("No camera here supports manual focus — can't do a focus bracket");
             return false;
         }
         return true;
-    }
-
-    private void addChoiceIfUsable(String logicalId, String physicalId, String labelPrefix,
-                                    CameraCharacteristics c) {
-        Float minDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
-        if (minDist == null || minDist <= 0f) return; // fixed-focus lens
-        Integer orient = c.get(CameraCharacteristics.SENSOR_ORIENTATION);
-        String label = String.format("%s (%.0f°, %.1fD)", labelPrefix, horizontalFovDeg(c), minDist);
-        cameraChoices.add(new CameraChoice(logicalId, physicalId, label, minDist,
-                orient == null ? 90 : orient, c));
     }
 
     private static float horizontalFovDeg(CameraCharacteristics c) {
@@ -322,25 +309,32 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
 
     private void cycleCamera() {
         if (cameraChoices.size() < 2 || capturing) return;
-        selectedChoice = (selectedChoice + 1) % cameraChoices.size();
-        farDistance = null;
-        nearDistance = null;
-        focusBar.setFar(null);
-        focusBar.setNear(null);
-        updateIntervalPreview();
         closeCamera();
-        applyChoiceToUi();
+        applyChoice((selectedChoice + 1) % cameraChoices.size());
         maybeOpenCamera();
     }
 
-    private void applyChoiceToUi() {
-        CameraChoice choice = cameraChoices.get(selectedChoice);
+    private void applyChoice(int index) {
+        selectedChoice = index;
+        CameraChoice choice = cameraChoices.get(index);
+        cameraId = choice.id;
+        characteristics = choice.characteristics;
+        sensorOrientation = choice.sensorOrientation;
+        minFocusDistance = choice.minFocusDistance;
+
         cameraButton.setText("Lens: " + choice.label);
         cameraButton.setEnabled(cameraChoices.size() > 1);
-        focusBar.setRange(0f, choice.minFocusDistance);
-        focusBar.setCurrent(0f);
 
-        StreamConfigurationMap map = choice.characteristics.get(
+        farDistance = null;
+        nearDistance = null;
+        focusBar.setRange(0f, minFocusDistance);
+        focusBar.setCurrent(0f);
+        focusBar.setFar(null);
+        focusBar.setNear(null);
+        focusBar.setIntervalSteps(null);
+        captureButton.setEnabled(false);
+
+        StreamConfigurationMap map = characteristics.get(
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
         previewSize = sizeNear(map.getOutputSizes(SurfaceTexture.class), 1280 * 720);
         stillSize = largestJpegUnder(map.getOutputSizes(ImageFormat.JPEG), 12_000_000);
@@ -430,7 +424,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     }
 
     private void maybeOpenCamera() {
-        if (cameraDevice != null || cameraChoices == null || bgHandler == null) return;
+        if (cameraDevice != null || cameraId == null || bgHandler == null) return;
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return;
         if (!textureView.isAvailable()) return;
 
@@ -442,10 +436,9 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
                 stillSize.getWidth(), stillSize.getHeight(), ImageFormat.JPEG, 2);
         stillReader.setOnImageAvailableListener(this::onStillImageAvailable, bgHandler);
 
-        String logicalId = cameraChoices.get(selectedChoice).logicalId;
         try {
             //noinspection MissingPermission - checked above
-            cameraManager.openCamera(logicalId, new CameraDevice.StateCallback() {
+            cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice cam) {
                     cameraDevice = cam;
@@ -478,23 +471,16 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     }
 
     private void startPreviewSession() {
-        CameraChoice choice = cameraChoices.get(selectedChoice);
-        OutputConfiguration previewCfg = new OutputConfiguration(previewSurface);
-        OutputConfiguration stillCfg = new OutputConfiguration(stillReader.getSurface());
-        if (choice.physicalId != null) {
-            previewCfg.setPhysicalCameraId(choice.physicalId);
-            stillCfg.setPhysicalCameraId(choice.physicalId);
-        }
         try {
-            cameraDevice.createCaptureSessionByOutputConfigurations(
-                    Arrays.asList(previewCfg, stillCfg),
+            cameraDevice.createCaptureSession(
+                    java.util.Arrays.asList(previewSurface, stillReader.getSurface()),
                     new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(CameraCaptureSession s) {
                             if (cameraDevice == null) return;
                             session = s;
                             try {
-                                pushManualFocus(focusBar.getCurrent());
+                                setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
                                 uiHandler.post(() -> setControlsEnabled(true));
                             } catch (CameraAccessException e) {
                                 uiHandler.post(() -> fail("Preview request failed: " + e.getMessage()));
@@ -509,6 +495,16 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         } catch (CameraAccessException e) {
             fail("Create session failed: " + e.getMessage());
         }
+    }
+
+    private void setRepeatingPreview(int afMode, Float focusDistance) throws CameraAccessException {
+        CaptureRequest.Builder req = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+        req.addTarget(previewSurface);
+        req.set(CaptureRequest.CONTROL_AF_MODE, afMode);
+        if (focusDistance != null) {
+            req.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance);
+        }
+        session.setRepeatingRequest(req.build(), afCallback, bgHandler);
     }
 
     @Override
@@ -527,110 +523,94 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     @Override
     public void onSurfaceTextureUpdated(SurfaceTexture surface) {}
 
-    // ---- manual focus (the bar is authoritative; no AF in this path) ------
+    // ---- focus lock (mirrors Google's Camera2Basic lockFocus() pattern) ---
 
-    private void onFocusBarDragged(float distance) {
-        long now = android.os.SystemClock.elapsedRealtime();
-        if (now - lastFocusPushMs < FOCUS_PREVIEW_THROTTLE_MS) return;
-        lastFocusPushMs = now;
-        bgHandler.post(() -> {
-            try {
-                pushManualFocus(distance);
-            } catch (CameraAccessException ignored) {
-            }
-        });
-    }
-
-    private void pushManualFocus(float distance) throws CameraAccessException {
-        if (session == null || capturing) return;
-        CaptureRequest.Builder req = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-        req.addTarget(previewSurface);
-        req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
-        req.set(CaptureRequest.LENS_FOCUS_DISTANCE, distance);
-        session.setRepeatingRequest(req.build(), null, bgHandler);
-    }
-
-    private void setBound(boolean isFar) {
-        float distance = focusBar.getCurrent();
-        if (isFar) {
-            farDistance = distance;
-            focusBar.setFar(distance);
-        } else {
-            nearDistance = distance;
-            focusBar.setNear(distance);
-        }
-        updateIntervalPreview();
-        captureButton.setEnabled(farDistance != null && nearDistance != null);
-        status.setText(String.format("%s set to %.2f D", isFar ? "Far" : "Near", distance));
-    }
-
-    /**
-     * Best-effort assist, not a dependency: one AF trigger with a short
-     * timeout that, on success, only moves the live focus-bar position —
-     * it never blocks Set Far/Set Near/Capture, and always resolves (no
-     * state the UI can get stuck in), unlike the old blocking AF-lock flow.
-     */
-    private void autofocusAssist() {
-        if (session == null || capturing || autofocusing) return;
-        autofocusing = true;
-        status.setText("Autofocusing…");
+    private void lockFocus(boolean isFar) {
+        if (session == null || capturing || afState != AfState.PREVIEW) return;
+        afState = isFar ? AfState.WAITING_LOCK_FAR : AfState.WAITING_LOCK_NEAR;
+        setControlsEnabled(false);
+        status.setText("Focusing (" + (isFar ? "far" : "near") + ")…");
         try {
             CaptureRequest.Builder req = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             req.addTarget(previewSurface);
             req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
             req.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
-            session.capture(req.build(), autofocusCallback, bgHandler);
-            bgHandler.postDelayed(this::onAutofocusTimeout, AUTOFOCUS_ASSIST_TIMEOUT_MS);
+            session.capture(req.build(), afCallback, bgHandler);
+            bgHandler.postDelayed(() -> onAfLockTimeout(afState), AF_LOCK_TIMEOUT_MS);
         } catch (CameraAccessException e) {
-            autofocusing = false;
-            status.setText("Autofocus failed: " + e.getMessage());
+            afState = AfState.PREVIEW;
+            uiHandler.post(() -> {
+                status.setText("Focus failed: " + e.getMessage());
+                setControlsEnabled(true);
+            });
         }
     }
 
-    private void onAutofocusTimeout() {
-        if (!autofocusing) return;
-        resolveAutofocus(null);
-        uiHandler.post(() -> status.setText("Autofocus timed out — drag the bar manually"));
-    }
-
-    private void resolveAutofocus(Float distance) {
-        autofocusing = false;
+    private void onAfLockTimeout(AfState stateWhenScheduled) {
+        if (afState != stateWhenScheduled) return; // already resolved
+        afState = AfState.PREVIEW;
         try {
-            pushManualFocus(focusBar.getCurrent());
+            setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
         } catch (CameraAccessException ignored) {
         }
-        if (distance != null) {
-            uiHandler.post(() -> {
-                focusBar.setCurrent(distance);
-                status.setText(String.format("Autofocus landed at %.2f D", distance));
-            });
-            bgHandler.post(() -> {
-                try {
-                    pushManualFocus(distance);
-                } catch (CameraAccessException ignored) {
-                }
-            });
-        }
+        uiHandler.post(() -> {
+            status.setText("Autofocus timed out, try again");
+            setControlsEnabled(true);
+        });
     }
 
-    private final CameraCaptureSession.CaptureCallback autofocusCallback =
+    private final CameraCaptureSession.CaptureCallback afCallback =
             new CameraCaptureSession.CaptureCallback() {
                 @Override
                 public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest r, TotalCaptureResult result) {
-                    if (!autofocusing) return;
+                    if (afState == AfState.PREVIEW) return;
                     Integer af = result.get(CaptureResult.CONTROL_AF_STATE);
                     if (af == null) return;
                     boolean locked = af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
                             || af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
                     if (!locked) return;
+
                     Float distance = result.get(CaptureResult.LENS_FOCUS_DISTANCE);
-                    resolveAutofocus(distance);
+                    boolean wasFar = afState == AfState.WAITING_LOCK_FAR;
+                    afState = AfState.PREVIEW;
+                    if (distance != null) {
+                        if (wasFar) farDistance = distance; else nearDistance = distance;
+                        uiHandler.post(() -> {
+                            focusBar.setCurrent(distance);
+                            if (wasFar) focusBar.setFar(distance); else focusBar.setNear(distance);
+                            updateIntervalPreview();
+                        });
+                    }
+
+                    try {
+                        CaptureRequest.Builder cancel = cameraDevice.createCaptureRequest(
+                                CameraDevice.TEMPLATE_PREVIEW);
+                        cancel.addTarget(previewSurface);
+                        cancel.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+                        cancel.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                                CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
+                        s.capture(cancel.build(), null, bgHandler);
+                        setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
+                    } catch (CameraAccessException ignored) {
+                    }
+
+                    uiHandler.post(() -> {
+                        String label = wasFar ? "Far" : "Near";
+                        status.setText(distance != null
+                                ? String.format("%s focus set (%.2f D)", label, distance)
+                                : label + " focus locked");
+                        setControlsEnabled(true);
+                    });
                 }
 
                 @Override
                 public void onCaptureFailed(CameraCaptureSession s, CaptureRequest r, CaptureFailure failure) {
-                    if (!autofocusing) return;
-                    resolveAutofocus(null);
+                    if (afState == AfState.PREVIEW) return;
+                    afState = AfState.PREVIEW;
+                    uiHandler.post(() -> {
+                        status.setText("Autofocus capture failed, try again");
+                        setControlsEnabled(true);
+                    });
                 }
             };
 
@@ -659,11 +639,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         }
         float distance = bracketSteps[bracketIndex];
         try {
-            CaptureRequest.Builder req = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            req.addTarget(previewSurface);
-            req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
-            req.set(CaptureRequest.LENS_FOCUS_DISTANCE, distance);
-            session.setRepeatingRequest(req.build(), null, bgHandler);
+            setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_OFF, distance);
         } catch (CameraAccessException e) {
             abortCapture("Focus step failed: " + e.getMessage());
             return;
@@ -724,7 +700,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private void finishCapture() {
         capturing = false;
         try {
-            pushManualFocus(focusBar.getCurrent());
+            setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
         } catch (CameraAccessException ignored) {
         }
         List<String> result = capturedPaths;
@@ -737,7 +713,6 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     }
 
     private int jpegOrientation() {
-        int sensorOrientation = cameraChoices.get(selectedChoice).sensorOrientation;
         int deviceRotation = getWindowManager().getDefaultDisplay().getRotation();
         return (ORIENTATIONS.get(deviceRotation) + sensorOrientation + 270) % 360;
     }
