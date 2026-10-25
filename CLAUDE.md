@@ -125,6 +125,17 @@ Uses `MediaStore.ACTION_PICK_IMAGES` (API 33+) with a fallback to
 past API 29; `minSdk 24` is kept for consistency with the rest of the repo,
 not because this app is meaningfully tested that low.
 
+## Versioning
+
+`versionName` comes from the `VERSION` file (bumped by hand, e.g. `0.1.0`);
+`versionCode` is `git rev-list --count HEAD`, which only ever increases.
+`make install-hooks` installs `hooks/post-commit` into `.git/hooks/`
+(plain `.git/hooks/` isn't tracked by git, so this is a one-time step after
+cloning) — it tags `HEAD` as `v<VERSION>` whenever a commit changes the
+`VERSION` file, so a release build's `versionName` and its git tag can't
+drift apart. A pre-commit hook can't do this tagging: a tag has to point at
+a commit that already exists.
+
 ## Updating the vendored focus-stack checkout
 
 `FOCUS_STACK_DIR` (default `~/code/focus-stack`) is a git checkout of

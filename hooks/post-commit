@@ -1,0 +1,25 @@
+#!/bin/sh
+# Tags HEAD v<VERSION> whenever a commit changes the VERSION file, so a
+# release build's versionName and its git tag can never drift apart.
+# Installed via `make install-hooks` (plain `.git/hooks/` isn't tracked).
+#
+# A pre-commit hook can't do this: a tag has to point at a commit that
+# already exists, and pre-commit runs before the commit object is created.
+
+set -e
+
+if git rev-parse HEAD^ >/dev/null 2>&1; then
+    git diff --name-only HEAD^ HEAD -- VERSION | grep -q . || exit 0
+fi
+# No HEAD^ means this is the repo's first commit — tag it too.
+
+VERSION=$(cat VERSION)
+TAG="v$VERSION"
+
+if git rev-parse "$TAG" >/dev/null 2>&1; then
+    echo "post-commit: tag $TAG already exists, not re-tagging (bump VERSION?)" >&2
+    exit 0
+fi
+
+git tag "$TAG"
+echo "post-commit: tagged $TAG"

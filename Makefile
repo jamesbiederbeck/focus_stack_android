@@ -20,6 +20,14 @@ AAPT2 = /usr/lib/android-sdk/build-tools/34.0.0/aapt2
 MIN_SDK = 24
 TARGET_SDK = 34
 
+# versionName comes from the VERSION file (bumped by hand); versionCode is
+# the total commit count, which only ever increases. A post-commit hook
+# (see hooks/post-commit, installed via `make install-hooks`) tags the repo
+# `v<VERSION>` whenever a commit changes the VERSION file, so a release
+# build and its git tag never drift apart.
+VERSION_NAME := $(shell cat VERSION)
+VERSION_CODE := $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
+
 KEYSTORE = debug.keystore
 
 # Hardcoded device addresses go stale (the tablet is on DHCP), so pick the
@@ -144,6 +152,9 @@ $(UNSIGNED): $(DEX) $(RESZIP) $(NATIVE_STAMP) AndroidManifest.xml
 		--manifest AndroidManifest.xml \
 		--min-sdk-version $(MIN_SDK) \
 		--target-sdk-version $(TARGET_SDK) \
+		--version-name $(VERSION_NAME) \
+		--version-code $(VERSION_CODE) \
+		--replace-version \
 		$(RESZIP) \
 		-o $(UNSIGNED)
 	zip -j -u $(UNSIGNED) $(DEX)
@@ -184,4 +195,10 @@ logcat:
 clean:
 	rm -rf out *.apk *.apk.idsig $(JNI_BUILD_DIR)
 
-.PHONY: all install run keystore logcat clean
+# .git/hooks isn't tracked by git, so the hook lives at hooks/post-commit
+# and gets copied in on demand instead.
+install-hooks:
+	cp hooks/post-commit .git/hooks/post-commit
+	chmod +x .git/hooks/post-commit
+
+.PHONY: all install run keystore logcat clean install-hooks
