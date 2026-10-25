@@ -42,22 +42,24 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Guided manual-focus bracket capture: "Focus Far"/"Focus Near" each
- * autofocus-and-lock on whatever the camera is pointed at and record the
- * resulting lens distance; "Capture N" then shoots a manual-focus series
- * (CONTROL_AF_MODE_OFF, stepping LENS_FOCUS_DISTANCE linearly in diopters)
- * between those two points and returns the file paths, in far-to-near
- * order, for MainActivity to feed into FocusStackBridge. Framework Camera2
- * only (no CameraX/androidx), matching the rest of this tree; the
- * focus-lock state machine mirrors Google's Camera2Basic sample, which is
- * the canonical correct way to drive CONTROL_AF_TRIGGER.
+ * Guided manual-focus bracket capture. Two ways to set the far/near points:
+ * by default, "Focus Far"/"Focus Near" each autofocus-and-lock on whatever
+ * the camera is pointed at and record the resulting lens distance (the
+ * focus-lock state machine mirrors Google's Camera2Basic sample, the
+ * canonical correct way to drive CONTROL_AF_TRIGGER); with the "Manual
+ * Focus" toggle on, FocusBarView instead drives LENS_FOCUS_DISTANCE
+ * directly as the user drags it (real-time focus-by-eye, no AF trigger
+ * involved) and Far/Near just record wherever it currently sits. Either
+ * way, "Capture N" shoots a manual-focus series (CONTROL_AF_MODE_OFF,
+ * linear diopter steps) between those two points and returns the file
+ * paths, in far-to-near order, for MainActivity to feed into
+ * FocusStackBridge. Framework Camera2 only (no CameraX/androidx), matching
+ * the rest of this tree.
  *
  * A lens selector cycles whole camera ids (not Pixel-style hidden physical
  * sub-lenses selectable via OutputConfiguration.setPhysicalCameraId, as
  * stereovision's StereoRig does — out of scope here, not because it's
- * broken). A FocusBarView shows, read-only, where the AF-lock results
- * landed and what the planned bracket's steps are — it doesn't drive focus
- * itself, the AF-lock buttons still do.
+ * broken).
  *
  * (A previous version of this comment blamed a black preview on
  * single-physical-id binding; that was wrong. The actual cause was
@@ -114,7 +116,8 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private TextureView textureView;
     private FocusBarView focusBar;
     private TextView status, shotsLabel;
-    private Button cameraButton, farButton, nearButton, captureButton, minusButton, plusButton;
+    private Button cameraButton, manualFocusButton, farButton, nearButton, captureButton,
+            minusButton, plusButton;
 
     private HandlerThread bgThread;
     private Handler bgHandler;
@@ -138,6 +141,8 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private Runnable afTimeoutRunnable;
     private Float farDistance, nearDistance;
     private int shots = DEFAULT_SHOTS;
+    private boolean manualFocus;
+    private long lastManualFocusPushMs;
 
     private boolean capturing;
     private float[] bracketSteps;
@@ -179,8 +184,14 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         root.addView(cameraButton);
 
         focusBar = new FocusBarView(this);
+        focusBar.setListener(this::onFocusBarDragged);
         root.addView(focusBar, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        manualFocusButton = new Button(this);
+        manualFocusButton.setOnClickListener(v -> toggleManualFocus());
+        root.addView(manualFocusButton);
+        updateManualFocusButtonText();
 
         status = new TextView(this);
         status.setText("Point the camera, then set the far and near focus points.");
@@ -194,11 +205,11 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         farButton = new Button(this);
         farButton.setText("Focus Far");
         farButton.setEnabled(false);
-        farButton.setOnClickListener(v -> lockFocus(true));
+        farButton.setOnClickListener(v -> onFarOrNearPressed(true));
         nearButton = new Button(this);
         nearButton.setText("Focus Near");
         nearButton.setEnabled(false);
-        nearButton.setOnClickListener(v -> lockFocus(false));
+        nearButton.setOnClickListener(v -> onFarOrNearPressed(false));
         focusRow.addView(farButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         focusRow.addView(nearButton, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         root.addView(focusRow);
@@ -256,11 +267,87 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
 
     private void setControlsEnabled(boolean enabled) {
         cameraButton.setEnabled(enabled && cameraChoices.size() > 1);
+        manualFocusButton.setEnabled(enabled);
         farButton.setEnabled(enabled);
         nearButton.setEnabled(enabled);
         minusButton.setEnabled(enabled);
         plusButton.setEnabled(enabled);
         captureButton.setEnabled(enabled && farDistance != null && nearDistance != null);
+    }
+
+    private void updateManualFocusButtonText() {
+        manualFocusButton.setText("Manual Focus: " + (manualFocus ? "On" : "Off"));
+    }
+
+    /**
+     * With manual focus off (default), Far/Near drive the AF-lock flow as
+     * before. With it on, the bar is already live-focusing the preview as
+     * the user drags it, so Far/Near just record wherever it currently
+     * sits — no AF trigger involved.
+     */
+    private void onFarOrNearPressed(boolean isFar) {
+        if (manualFocus) {
+            recordBound(isFar, focusBar.getCurrent());
+        } else {
+            lockFocus(isFar);
+        }
+    }
+
+    private void recordBound(boolean isFar, float distance) {
+        if (isFar) {
+            farDistance = distance;
+            focusBar.setFar(distance);
+        } else {
+            nearDistance = distance;
+            focusBar.setNear(distance);
+        }
+        updateIntervalPreview();
+        captureButton.setEnabled(farDistance != null && nearDistance != null);
+        status.setText(String.format("%s set to %.2f D", isFar ? "Far" : "Near", distance));
+    }
+
+    private void toggleManualFocus() {
+        if (session == null || capturing) return;
+        manualFocus = !manualFocus;
+        updateManualFocusButtonText();
+        focusBar.setInteractive(manualFocus);
+
+        if (manualFocus) {
+            // Cancel any AF lock in flight — manual mode takes over the
+            // same repeating request AF-lock was using.
+            if (afState != AfState.PREVIEW) {
+                bgHandler.removeCallbacks(afTimeoutRunnable);
+                afState = AfState.PREVIEW;
+            }
+            status.setText("Manual focus on — drag the bar, then Far/Near");
+            bgHandler.post(() -> {
+                try {
+                    setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_OFF, focusBar.getCurrent());
+                } catch (CameraAccessException ignored) {
+                }
+            });
+        } else {
+            status.setText("Manual focus off — Far/Near autofocus again");
+            bgHandler.post(() -> {
+                try {
+                    setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
+                } catch (CameraAccessException ignored) {
+                }
+            });
+        }
+    }
+
+    private void onFocusBarDragged(float distance) {
+        if (!manualFocus || session == null || capturing) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastManualFocusPushMs < 50) return;
+        lastManualFocusPushMs = now;
+        bgHandler.post(() -> {
+            try {
+                setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_OFF, distance);
+            } catch (CameraAccessException ignored) {
+            }
+        });
     }
 
     // ---- camera discovery (no permission needed for characteristics) ----
@@ -334,6 +421,9 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
 
         farDistance = null;
         nearDistance = null;
+        manualFocus = false;
+        updateManualFocusButtonText();
+        focusBar.setInteractive(false);
         focusBar.setRange(0f, minFocusDistance);
         focusBar.setCurrent(0f);
         focusBar.setFar(null);
@@ -725,7 +815,11 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private void finishCapture() {
         capturing = false;
         try {
-            setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
+            if (manualFocus) {
+                setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_OFF, focusBar.getCurrent());
+            } else {
+                setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
+            }
         } catch (CameraAccessException ignored) {
         }
         List<String> result = capturedPaths;

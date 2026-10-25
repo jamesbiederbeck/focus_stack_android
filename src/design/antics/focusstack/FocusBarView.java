@@ -13,10 +13,11 @@ import android.view.View;
  * Dragging moves the live "current" thumb and reports every intermediate
  * position via Listener.onCurrentChanged, so the caller can push it
  * straight to a manual-focus preview request for real-time focus-by-eye
- * feedback — no autofocus involved, which sidesteps CONTROL_AF_STATE never
- * reaching a locked state on some devices. Far/near markers and the
- * planned bracket's interval ticks are drawn once set but aren't
- * interactive themselves.
+ * feedback — only while {@link #setInteractive} is true (CaptureActivity
+ * gates this on its manual-focus toggle; with it off, the AF-lock buttons
+ * drive focus instead and the bar is a read-only display of where they
+ * landed). Far/near markers and the planned bracket's interval ticks are
+ * drawn once set but aren't interactive themselves.
  */
 final class FocusBarView extends View {
 
@@ -29,6 +30,7 @@ final class FocusBarView extends View {
     private Float farDistance, nearDistance;
     private float[] intervalSteps;
     private Listener listener;
+    private boolean interactive;
 
     private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint tickPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -62,6 +64,11 @@ final class FocusBarView extends View {
 
     void setListener(Listener l) {
         listener = l;
+    }
+
+    /** Whether dragging moves the current-focus thumb at all. */
+    void setInteractive(boolean interactive) {
+        this.interactive = interactive;
     }
 
     /** min/max in diopters; min is normally 0 (infinity), max is LENS_INFO_MINIMUM_FOCUS_DISTANCE. */
@@ -160,6 +167,7 @@ final class FocusBarView extends View {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        if (!interactive) return false;
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_MOVE:
