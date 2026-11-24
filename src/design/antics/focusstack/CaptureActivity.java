@@ -149,7 +149,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     private Runnable afTimeoutRunnable;
     private Float farDistance, nearDistance;
     private int shots = DEFAULT_SHOTS;
-    private boolean manualFocus;
+    private boolean manualFocus = true; // default on; AF-lock is the opt-in alternative
     private long lastManualFocusPushMs;
 
     private boolean capturing;
@@ -202,7 +202,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
         updateManualFocusButtonText();
 
         status = new TextView(this);
-        status.setText("Point the camera, then set the far and near focus points.");
+        status.setText("Drag the bar to focus, then set the far and near points.");
         status.setGravity(Gravity.CENTER);
         int pad = (int) (12 * getResources().getDisplayMetrics().density);
         status.setPadding(pad, pad, pad, pad);
@@ -288,7 +288,7 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
     }
 
     /**
-     * With manual focus off (default), Far/Near drive the AF-lock flow as
+     * With manual focus off (opt-in), Far/Near drive the AF-lock flow as
      * before. With it on, the bar is already live-focusing the preview as
      * the user drags it, so Far/Near just record wherever it currently
      * sits — no AF trigger involved.
@@ -550,9 +550,9 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
 
         farDistance = null;
         nearDistance = null;
-        manualFocus = false;
+        manualFocus = true;
         updateManualFocusButtonText();
-        focusBar.setInteractive(false);
+        focusBar.setInteractive(true);
         focusBar.setRange(0f, minFocusDistance);
         focusBar.setCurrent(0f);
         focusBar.setFar(null);
@@ -706,7 +706,11 @@ public class CaptureActivity extends Activity implements TextureView.SurfaceText
                             if (cameraDevice == null) return;
                             session = s;
                             try {
-                                setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
+                                if (manualFocus) {
+                                    setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_OFF, focusBar.getCurrent());
+                                } else {
+                                    setRepeatingPreview(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, null);
+                                }
                                 uiHandler.post(() -> setControlsEnabled(true));
                             } catch (CameraAccessException e) {
                                 uiHandler.post(() -> fail("Preview request failed: " + e.getMessage()));

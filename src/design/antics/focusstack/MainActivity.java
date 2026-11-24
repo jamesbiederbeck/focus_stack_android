@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -21,6 +22,7 @@ import android.provider.MediaStore;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -55,10 +57,20 @@ public class MainActivity extends Activity {
 
     private static final int PICK_IMAGES_MAX = 20;
 
+    // Focus-sweep GIF: one frame per input at 1s, then the stacked result
+    // held for 5s. Frames are downscaled hard — a GIF of 12MP frames would
+    // be tens of MB and nobody views it that large.
+    private static final int GIF_MAX_EDGE = 640;
+    private static final int GIF_FRAME_CS = 100;
+    private static final int GIF_RESULT_CS = 500;
+    private static final String PREFS = "focusstack";
+    private static final String PREF_GIF = "save_gif";
+
     private TextView status;
     private ImageView preview;
     private ProgressBar progress;
     private Button pickButton, captureButton;
+    private CheckBox gifToggle;
 
     private HandlerThread workerThread;
     private Handler workerHandler;
@@ -95,6 +107,14 @@ public class MainActivity extends Activity {
         captureButton.setText("Capture Stack with Camera");
         captureButton.setOnClickListener(v -> launchCapture());
         root.addView(captureButton);
+
+        gifToggle = new CheckBox(this);
+        gifToggle.setText("Also save focus-sweep GIF (1s/photo, 5s stacked)");
+        gifToggle.setTextColor(Color.WHITE);
+        gifToggle.setChecked(getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_GIF, true));
+        gifToggle.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_GIF, checked).apply());
+        root.addView(gifToggle);
 
         progress = new ProgressBar(this);
         progress.setIndeterminate(true);
@@ -196,6 +216,7 @@ public class MainActivity extends Activity {
     }
 
     private void runStack(List<Uri> uris) {
+        final boolean makeGif = gifToggle.isChecked();
         setBusy(true, "Preparing " + uris.size() + " photos…");
         pickButton.setEnabled(false);
         captureButton.setEnabled(false);
@@ -227,17 +248,31 @@ public class MainActivity extends Activity {
                     return;
                 }
 
-                Uri savedUri = saveToMediaStore(outFile);
-                uiHandler.post(() -> onStackSucceeded(outFile, savedUri));
+                Uri savedUri = saveToMediaStore(outFile, "focus_stack_", ".jpg", "image/jpeg");
+
+                String gifNote = "";
+                if (makeGif) {
+                    uiHandler.post(() -> setBusy(true, "Encoding GIF…"));
+                    try {
+                        File gifFile = new File(getCacheDir(), "focus_sweep.gif");
+                        buildGif(inputPaths, outFile, gifFile);
+                        gifNote = saveToMediaStore(gifFile, "focus_sweep_", ".gif", "image/gif") != null
+                                ? " + GIF" : " (GIF save failed)";
+                    } catch (IOException | RuntimeException | OutOfMemoryError e) {
+                        gifNote = " (GIF failed: " + e.getMessage() + ")";
+                    }
+                }
+                final String note = gifNote;
+                uiHandler.post(() -> onStackSucceeded(outFile, savedUri, note));
             } catch (IOException e) {
                 uiHandler.post(() -> onStackFailed(e.getMessage()));
             }
         });
     }
 
-    private void onStackSucceeded(File outFile, Uri savedUri) {
+    private void onStackSucceeded(File outFile, Uri savedUri, String note) {
         setBusy(false, savedUri != null
-                ? "Saved to Pictures/FocusStack"
+                ? "Saved to Pictures/FocusStack" + note
                 : "Stacked, but saving to gallery failed");
         pickButton.setEnabled(true);
         captureButton.setEnabled(true);
@@ -294,6 +329,53 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Writes the sweep GIF: each input in order (the capture/pick order is
+     * the focus sweep), then the stacked result. Re-reads the already
+     * downscaled, EXIF-normalized inputs from the cache dir, one at a time.
+     */
+    private void buildGif(List<String> inputPaths, File result, File dest) throws IOException {
+        int[] size = fileBounds(inputPaths.get(0));
+        float scale = Math.min(1f, GIF_MAX_EDGE / (float) Math.max(size[0], size[1]));
+        int w = Math.max(1, Math.round(size[0] * scale));
+        int h = Math.max(1, Math.round(size[1] * scale));
+
+        try (OutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(dest))) {
+            GifEncoder enc = new GifEncoder(out, w, h);
+            for (String path : inputPaths) {
+                addGifFrame(enc, path, w, h, GIF_FRAME_CS);
+            }
+            addGifFrame(enc, result.getAbsolutePath(), w, h, GIF_RESULT_CS);
+            enc.finish();
+        }
+    }
+
+    private void addGifFrame(GifEncoder enc, String path, int w, int h, int delayCs) throws IOException {
+        int[] size = fileBounds(path);
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = Math.max(1, Integer.highestOneBit(Math.max(1, size[0] / w)));
+        Bitmap decoded = BitmapFactory.decodeFile(path, opts);
+        if (decoded == null) {
+            throw new IOException("Could not decode " + path);
+        }
+        // The stacked result can come back slightly cropped/resized by
+        // alignment, so every frame is forced to the first frame's size.
+        Bitmap scaled = Bitmap.createScaledBitmap(decoded, w, h, true);
+        if (scaled != decoded) decoded.recycle();
+        try {
+            enc.addFrame(scaled, delayCs);
+        } finally {
+            scaled.recycle();
+        }
+    }
+
+    private static int[] fileBounds(String path) {
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(path, opts);
+        return new int[]{opts.outWidth, opts.outHeight};
+    }
+
     private int[] decodeBounds(Uri uri) throws IOException {
         BitmapFactory.Options opts = new BitmapFactory.Options();
         opts.inJustDecodeBounds = true;
@@ -334,13 +416,13 @@ public class MainActivity extends Activity {
      * targets the devices in CLAUDE.md's fleet, which all run well past
      * API 29, so that path is intentionally not implemented.
      */
-    private Uri saveToMediaStore(File source) {
+    private Uri saveToMediaStore(File source, String namePrefix, String ext, String mime) {
         if (Build.VERSION.SDK_INT < 29) {
             return null;
         }
         ContentValues values = new ContentValues();
-        values.put(MediaStore.Images.Media.DISPLAY_NAME, "focus_stack_" + System.currentTimeMillis() + ".jpg");
-        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, namePrefix + System.currentTimeMillis() + ext);
+        values.put(MediaStore.Images.Media.MIME_TYPE, mime);
         values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/FocusStack");
 
         Uri collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
